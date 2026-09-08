@@ -8,17 +8,14 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
-from src.data.collector import collect_trajectories
-from src.data.model_dataset import ModelDataset
-from src.data.source import split_by_trajectory
-from src.data.temporal_dataset import TemporalSequenceDataset
-from src.environments.factory import build_environment
+from src.data import collect_trajectories, split_trajectories, TemporalSequenceDataset
+from src.environments.gymnasium import GymnasiumEnvironment
 from src.evaluation.world_model_metrics import (
     evaluate_world_model,
     flip_binary_centered_actions,
 )
-from src.models.adapters.lewm import LeWMRGBAdapter
-from src.models.lewm_runtime import build_lewm, compute_lewm_loss
+from src.lewm import LeWMDataset, build_lewm, compute_lewm_loss
+from src.interfaces.environment import EnvironmentInterface
 
 
 def set_seed(seed: int) -> None:
@@ -36,22 +33,25 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def build_model_adapter(cfg: DictConfig, frame_skip: int):
-    if cfg.model.name != "lewm":
+def make_environment(cfg: DictConfig) -> EnvironmentInterface:
+    if cfg.backend != "gymnasium":
         raise NotImplementedError(
-            f"Model '{cfg.model.name}' is not implemented yet. "
-            "Add a model-specific adapter/runtime without changing the raw data pipeline."
+            f"Environment backend '{cfg.backend}' is not implemented yet"
         )
+    return GymnasiumEnvironment(
+        env_id=cfg.env_id,
+        observation_mode=cfg.observation_mode,
+    )
 
-    if cfg.model.observation_adapter != "rgb":
-        raise NotImplementedError(
-            "This refactor includes only the current LeWM RGB baseline adapter. "
-            "A future categorical ARC model should get its own adapter."
-        )
 
+def make_lewm_dataset(
+    temporal_dataset: TemporalSequenceDataset,
+    cfg: DictConfig,
+    frame_skip: int,
+) -> LeWMDataset:
     action_cfg = cfg.environment.action
-
-    return LeWMRGBAdapter(
+    return LeWMDataset(
+        temporal_dataset,
         image_size=cfg.model.image_size,
         frame_skip=frame_skip,
         action_type=action_cfg.type,
@@ -72,13 +72,9 @@ def validate(
     history_size: int,
     sigreg_weight: float,
     device: torch.device,
-):
+) -> dict[str, float]:
     model.eval()
-
-    total_loss = 0.0
-    total_pred = 0.0
-    total_sigreg = 0.0
-    num_batches = 0
+    totals = {"loss": 0.0, "pred_loss": 0.0, "sigreg_loss": 0.0}
 
     for batch in loader:
         with torch.autocast(
@@ -94,36 +90,35 @@ def validate(
                 sigreg_weight=sigreg_weight,
                 device=device,
             )
+        totals["loss"] += loss.item()
+        totals["pred_loss"] += pred_loss.item()
+        totals["sigreg_loss"] += sigreg_loss.item()
 
-        total_loss += loss.item()
-        total_pred += pred_loss.item()
-        total_sigreg += sigreg_loss.item()
-        num_batches += 1
-
-    return {
-        "loss": total_loss / num_batches,
-        "pred_loss": total_pred / num_batches,
-        "sigreg_loss": total_sigreg / num_batches,
-    }
+    n = len(loader)
+    return {key: value / n for key, value in totals.items()}
 
 
 def get_counterfactual_fn(cfg: DictConfig):
     name = cfg.environment.get("counterfactual", None)
-
     if name is None:
         return None
     if name == "flip_binary_centered":
         return flip_binary_centered_actions
-
     raise ValueError(f"Unknown counterfactual evaluator: {name}")
 
 
 @hydra.main(
     version_base=None,
-    config_path="../../config/pipeline",
+    config_path="../config/pipeline",
     config_name="config",
 )
 def main(cfg: DictConfig) -> None:
+    if cfg.model.name != "lewm":
+        raise NotImplementedError(
+            f"Model '{cfg.model.name}' is not implemented yet. "
+            "Add a model-specific dataset/runtime while keeping src.data unchanged."
+        )
+
     set_seed(cfg.seed)
     device = get_device()
 
@@ -134,62 +129,35 @@ def main(cfg: DictConfig) -> None:
     if device.type == "cuda":
         print("GPU:", torch.cuda.get_device_name(0))
 
-    # ------------------------------------------------------------------
-    # 1. SOURCE-SPECIFIC COLLECTION -> CANONICAL RAW TRAJECTORIES
-    # ------------------------------------------------------------------
-
-    env = build_environment(cfg.environment)
-
-    print(
-        f"Collecting {cfg.environment.collection.num_env_steps} raw environment steps..."
-    )
-
-    source = collect_trajectories(
-        env,
-        num_env_steps=cfg.environment.collection.num_env_steps,
-        seed=cfg.seed,
-    )
+    # 1) Environment -> raw trajectories.
+    env = make_environment(cfg.environment)
+    num_env_steps = int(cfg.environment.collection.num_env_steps)
+    print(f"Collecting {num_env_steps} raw environment steps...")
+    trajectories = collect_trajectories(env, num_env_steps=num_env_steps, seed=cfg.seed)
     env.close()
 
-    print(
-        f"Collected {source.num_steps} raw steps in {len(source)} trajectories."
-    )
-
-    train_source, val_source = split_by_trajectory(
-        source,
+    num_raw_steps = sum(t.num_steps for t in trajectories)
+    print(f"Collected {num_raw_steps} raw steps in {len(trajectories)} trajectories.")
+    train_trajectories, val_trajectories = split_trajectories(
+        trajectories,
         train_fraction=cfg.data.train_fraction,
         seed=cfg.seed,
     )
 
-    # ------------------------------------------------------------------
-    # 2. GENERIC TEMPORAL VIEW
-    # ------------------------------------------------------------------
-
-    frame_skip = cfg.environment.temporal.frame_skip
-    window_stride = cfg.environment.temporal.get("window_stride", None)
-
-    train_temporal = TemporalSequenceDataset(
-        train_source,
-        history_size=cfg.data.history_size,
+    # 2) Raw trajectories -> generic temporal samples. frame_skip lives here.
+    frame_skip = int(cfg.environment.temporal.frame_skip)
+    temporal_kwargs = dict(
+        history_size=int(cfg.data.history_size),
         frame_skip=frame_skip,
-        window_stride=window_stride,
-        allow_partial_final_chunk=cfg.data.allow_partial_final_chunk,
+        window_stride=cfg.environment.temporal.get("window_stride", None),
+        allow_partial_final_chunk=bool(cfg.data.allow_partial_final_chunk),
     )
-    val_temporal = TemporalSequenceDataset(
-        val_source,
-        history_size=cfg.data.history_size,
-        frame_skip=frame_skip,
-        window_stride=window_stride,
-        allow_partial_final_chunk=cfg.data.allow_partial_final_chunk,
-    )
+    train_temporal = TemporalSequenceDataset(train_trajectories, **temporal_kwargs)
+    val_temporal = TemporalSequenceDataset(val_trajectories, **temporal_kwargs)
 
-    # ------------------------------------------------------------------
-    # 3. MODEL-SPECIFIC ADAPTER
-    # ------------------------------------------------------------------
-
-    adapter = build_model_adapter(cfg, frame_skip=frame_skip)
-    train_dataset = ModelDataset(train_temporal, adapter)
-    val_dataset = ModelDataset(val_temporal, adapter)
+    # 3) Generic temporal samples -> vanilla LeWM tensors.
+    train_dataset = make_lewm_dataset(train_temporal, cfg, frame_skip)
+    val_dataset = make_lewm_dataset(val_temporal, cfg, frame_skip)
 
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         raise RuntimeError(
@@ -202,10 +170,9 @@ def main(cfg: DictConfig) -> None:
     print("Validation samples:", len(val_dataset))
     print("Example pixels:", tuple(sample["pixels"].shape))
     print("Example actions:", tuple(sample["action"].shape))
-    print("LeWM action input dim:", adapter.action_input_dim)
+    print("LeWM action input dim:", train_dataset.action_input_dim)
 
-    train_gen = torch.Generator().manual_seed(cfg.seed)
-
+    generator = torch.Generator().manual_seed(cfg.seed)
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg.training.batch_size,
@@ -213,31 +180,28 @@ def main(cfg: DictConfig) -> None:
         drop_last=True,
         num_workers=cfg.training.num_workers,
         pin_memory=(device.type == "cuda"),
-        generator=train_gen,
+        generator=generator,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg.training.batch_size,
         shuffle=False,
-        drop_last=False,
         num_workers=cfg.training.num_workers,
         pin_memory=(device.type == "cuda"),
     )
 
-    # ------------------------------------------------------------------
-    # 4. MODEL-SPECIFIC RUNTIME
-    # ------------------------------------------------------------------
-
+    # 4) Build and train LeWM.
     model, sigreg = build_lewm(
         cfg.model,
-        action_input_dim=adapter.action_input_dim,
+        action_input_dim=train_dataset.action_input_dim,
         history_size=cfg.data.history_size,
     )
     model = model.to(device)
     sigreg = sigreg.to(device)
-
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable parameters: {trainable:,}")
+    print(
+        "Trainable parameters:",
+        f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,}",
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -251,41 +215,27 @@ def main(cfg: DictConfig) -> None:
     def lr_schedule(step: int) -> float:
         if step < warmup_steps:
             return (step + 1) / warmup_steps
-
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lr_schedule,
-    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_schedule)
+    sigreg_weight = float(cfg.model.loss.sigreg.weight)
+    counterfactual_fn = get_counterfactual_fn(cfg)
 
-    data_root = Path(os.environ.get("JEPA_DATA_ROOT", "data"))
     checkpoint_dir = (
-        data_root
+        Path(os.environ.get("JEPA_DATA_ROOT", "data"))
         / "checkpoints"
         / f"{cfg.environment.name}_{cfg.model.name}"
     )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
     best_val_loss = float("inf")
-    sigreg_weight = float(cfg.model.loss.sigreg.weight)
-    counterfactual_fn = get_counterfactual_fn(cfg)
-
-    # ------------------------------------------------------------------
-    # 5. TRAIN
-    # ------------------------------------------------------------------
 
     for epoch in range(1, cfg.training.epochs + 1):
         model.train()
-
-        running_loss = 0.0
-        running_pred = 0.0
-        running_sigreg = 0.0
+        running = {"loss": 0.0, "pred": 0.0, "sigreg": 0.0}
 
         for batch_idx, batch in enumerate(train_loader):
             optimizer.zero_grad(set_to_none=True)
-
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
@@ -302,30 +252,22 @@ def main(cfg: DictConfig) -> None:
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=cfg.training.gradient_clip,
+                model.parameters(), max_norm=cfg.training.gradient_clip
             )
             optimizer.step()
             scheduler.step()
 
-            running_loss += loss.item()
-            running_pred += pred_loss.item()
-            running_sigreg += sigreg_loss.item()
+            running["loss"] += loss.item()
+            running["pred"] += pred_loss.item()
+            running["sigreg"] += sigreg_loss.item()
 
             if (
                 cfg.training.progress_every_n_batches > 0
                 and batch_idx % cfg.training.progress_every_n_batches == 0
             ):
-                print(
-                    f"  epoch {epoch:03d} | "
-                    f"batch {batch_idx:04d}/{len(train_loader)}"
-                )
+                print(f"  epoch {epoch:03d} | batch {batch_idx:04d}/{len(train_loader)}")
 
-        n_train_batches = len(train_loader)
-        train_loss = running_loss / n_train_batches
-        train_pred = running_pred / n_train_batches
-        train_sigreg = running_sigreg / n_train_batches
-
+        n_train = len(train_loader)
         val_metrics = validate(
             model,
             sigreg,
@@ -344,13 +286,12 @@ def main(cfg: DictConfig) -> None:
                 counterfactual_action_fn=counterfactual_fn,
             )
 
-        current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch:03d}/{cfg.training.epochs} | "
-            f"lr={current_lr:.2e} | "
-            f"train loss={train_loss:.4f} | "
-            f"train pred={train_pred:.4f} | "
-            f"train sigreg={train_sigreg:.4f} | "
+            f"lr={optimizer.param_groups[0]['lr']:.2e} | "
+            f"train loss={running['loss'] / n_train:.4f} | "
+            f"train pred={running['pred'] / n_train:.4f} | "
+            f"train sigreg={running['sigreg'] / n_train:.4f} | "
             f"val loss={val_metrics['loss']:.4f} | "
             f"val pred={val_metrics['pred_loss']:.4f} | "
             f"val sigreg={val_metrics['sigreg_loss']:.4f}"
@@ -368,7 +309,6 @@ def main(cfg: DictConfig) -> None:
                 f"retrieval={100 * wm_metrics['retrieval_top1']:.1f}% | "
                 f"latent std={wm_metrics['latent_feature_std']:.3f}"
             )
-
             if "counterfactual_mse" in wm_metrics:
                 print(
                     "               "

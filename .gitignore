@@ -26,7 +26,7 @@ checkpoints/
 *.pth
 
 # Data
-data/
+/data/
 datasets/
 
 # IDE

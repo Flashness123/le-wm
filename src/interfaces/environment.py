@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Generic, Optional, TypeVar
+from typing import Any, Generic, TypeVar
 
 ObservationT = TypeVar("ObservationT")
 ActionT = TypeVar("ActionT")
@@ -8,6 +8,8 @@ ActionT = TypeVar("ActionT")
 
 @dataclass
 class StepResult(Generic[ObservationT]):
+    """Result of one environment step in the common source interface."""
+
     observation: ObservationT
     reward: float
     terminated: bool
@@ -20,13 +22,16 @@ class StepResult(Generic[ObservationT]):
 
 
 class EnvironmentInterface(ABC, Generic[ObservationT, ActionT]):
-    """Minimal environment contract used by trajectory collectors."""
+    """
+    Minimal contract for interactive data sources.
+
+    Gymnasium, ARC, robotics, or another interactive environment only need to
+    implement this contract. Everything after collection works on Trajectory
+    objects and is independent of the environment implementation.
+    """
 
     @abstractmethod
-    def reset(
-        self,
-        seed: Optional[int] = None,
-    ) -> tuple[ObservationT, dict[str, Any]]:
+    def reset(self, seed: int | None = None) -> tuple[ObservationT, dict[str, Any]]:
         ...
 
     @abstractmethod

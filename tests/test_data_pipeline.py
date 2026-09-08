@@ -1,8 +1,6 @@
 import unittest
 
-from src.data.source import InMemoryTrajectorySource
-from src.data.temporal_dataset import TemporalSequenceDataset
-from src.data.trajectory import Trajectory
+from src.data import TemporalSequenceDataset, Trajectory
 
 
 def make_trajectory(num_steps: int, *, terminal: bool = True) -> Trajectory:
@@ -36,37 +34,32 @@ class TrajectoryTests(unittest.TestCase):
 
 class TemporalDatasetTests(unittest.TestCase):
     def test_frame_skip_is_applied_after_collection(self):
-        source = InMemoryTrajectorySource([make_trajectory(8)])
         dataset = TemporalSequenceDataset(
-            source,
+            [make_trajectory(8)],
             history_size=2,
             frame_skip=2,
         )
-
         sample = dataset[0]
         self.assertEqual(sample.observations, ["s0", "s2", "s4"])
         self.assertEqual(sample.action_chunks, [["a0", "a1"], ["a2", "a3"]])
         self.assertEqual(sample.reward_chunks, [[0.0, 1.0], [2.0, 3.0]])
 
     def test_partial_terminal_chunk_is_preserved_when_enabled(self):
-        source = InMemoryTrajectorySource([make_trajectory(5, terminal=True)])
         dataset = TemporalSequenceDataset(
-            source,
+            [make_trajectory(5, terminal=True)],
             history_size=2,
             frame_skip=3,
             allow_partial_final_chunk=True,
         )
-
         sample = dataset[0]
         self.assertEqual(sample.observations, ["s0", "s3", "s5"])
         self.assertEqual(sample.action_chunks, [["a0", "a1", "a2"], ["a3", "a4"]])
         self.assertEqual(sample.chunk_lengths, [3, 2])
         self.assertTrue(sample.terminated[-1])
 
-    def test_partial_terminal_chunk_is_not_exposed_to_fixed_width_model_when_disabled(self):
-        source = InMemoryTrajectorySource([make_trajectory(5, terminal=True)])
+    def test_partial_terminal_chunk_is_hidden_from_fixed_width_model(self):
         dataset = TemporalSequenceDataset(
-            source,
+            [make_trajectory(5, terminal=True)],
             history_size=2,
             frame_skip=3,
             allow_partial_final_chunk=False,
