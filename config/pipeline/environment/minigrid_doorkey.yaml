@@ -1,0 +1,18 @@
+name: minigrid_doorkey
+backend: gymnasium
+env_id: MiniGrid-DoorKey-8x8-v0
+observation_mode: pixels
+
+collection:
+  num_env_steps: 5000
+
+temporal:
+  frame_skip: 1
+  window_stride: null
+
+action:
+  type: discrete
+  num_actions: 7
+  encoding: one_hot
+
+counterfactual: null

@@ -1,0 +1,23 @@
+name: cartpole
+backend: gymnasium
+env_id: CartPole-v1
+observation_mode: pixels_with_state
+
+collection:
+  # Raw simulator steps. Roughly equivalent to the old 5000 stored
+  # frame_skip=4 transitions, while preserving every intermediate state.
+  num_env_steps: 20000
+
+temporal:
+  frame_skip: 4
+  # null => defaults to frame_skip, reproducing the old model-step alignment
+  window_stride: null
+
+action:
+  type: discrete
+  num_actions: 2
+  # Kept for comparability with the successful CartPole baseline.
+  # A future categorical model can use raw IDs / learned embeddings instead.
+  encoding: centered_binary
+
+counterfactual: flip_binary_centered

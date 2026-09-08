@@ -1,0 +1,15 @@
+defaults:
+  - environment: cartpole
+  - model: lewm
+  - training: default
+  - _self_
+
+seed: 42
+
+data:
+  history_size: 3
+  train_fraction: 0.8
+
+  # Raw trajectories keep terminal transitions regardless of this value.
+  # Vanilla LeWM currently requires fixed-width action chunks, so False.
+  allow_partial_final_chunk: false

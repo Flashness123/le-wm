@@ -1,0 +1,9 @@
+batch_size: 8
+epochs: 50
+learning_rate: 5.0e-5
+weight_decay: 1.0e-3
+warmup_fraction: 0.01
+gradient_clip: 1.0
+num_workers: 0
+metrics_every_n_epochs: 1
+progress_every_n_batches: 50
