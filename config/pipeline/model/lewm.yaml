@@ -1,0 +1,34 @@
+name: lewm
+observation_adapter: rgb
+
+image_size: 224
+embed_dim: 192
+
+preprocessing:
+  # Compatibility baseline only. ARC-specific categorical/spatial adapters
+  # should not inherit this by default.
+  normalization: imagenet
+  interpolation: bilinear
+
+encoder:
+  size: tiny
+  patch_size: 14
+  pretrained: false
+
+predictor:
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+projector:
+  hidden_dim: 2048
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024

@@ -1,0 +1,48 @@
+[tool.yapf]
+based_on_style = "pep8"
+
+indent_width = 2
+continuation_indent_width = 2
+column_limit = 200
+
+join_multiple_lines = true
+
+split_before_first_argument = false
+split_before_named_assigns = false
+allow_split_before_default_or_named_assigns = false
+
+split_arguments_when_comma_terminated = false
+disable_ending_comma_heuristic = true
+
+split_all_comma_separated_values = false
+split_all_top_level_comma_separated_values = false
+
+split_before_closing_bracket = false
+split_before_dict_set_generator = false
+split_complex_comprehension = false
+
+coalesce_brackets = true
+
+split_penalty_after_opening_bracket = 1000
+split_penalty_import_names = 1000
+split_penalty_for_added_line_split = 1000
+
+[project]
+name = "jepa-world-model"
+version = "0.1.0"
+description = "Action-conditioned world model research framework based on LeWM"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+
+dependencies = [
+    "datasets==2.20.0",
+    "pyarrow==20.0.0",
+    "pillow",
+    "minigrid",
+    "torch==2.14.0",
+    "torchvision==0.29.0",
+    "stable-pretraining==0.1.6",
+    "einops>=0.8.2",
+    "hydra-core>=1.3.6",
+    "omegaconf>=2.3.1",
+]
